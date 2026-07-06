@@ -1,9 +1,12 @@
-// OpenAI-compatible chat completions. Parity with the Python handler:
-// flatten content arrays, round-robin accounts, retry <= MAX_RETRIES,
-// 429 -> cooldown. Adds neuron accounting via pool.markSuccess.
+// OpenAI-compatible + CF-generic endpoints, all sharing one account-pool
+// rotation strategy with retry, 429 cooldown, backpressure-correct streaming,
+// and neuron accounting. Endpoints:
+//   POST /v1/chat/completions   (OpenAI chat, stream + non-stream)
+//   POST /v1/embeddings         (OpenAI embeddings — no usage from CF, best-effort)
+//   POST /ai/run/:model         (CF generic passthrough for ANY task/model)
 
 import { Router } from "express";
-import { chatUrl, callNormal, callStream } from "../lib/cf.js";
+import { chatUrl, embeddingsUrl, runUrl, callNormal, callStream } from "../lib/cf.js";
 
 // CF rejects multipart content — collapse OpenAI content arrays to a string.
 function flattenContent(messages) {
@@ -17,89 +20,113 @@ function flattenContent(messages) {
   return messages;
 }
 
-export function chatRouter({ pool, maxRetries, log }) {
+/**
+ * Run one non-streaming request across the pool, retrying on 429/network errors.
+ * `buildUrl(accountId)` picks the upstream URL per attempt. `success(json)`
+ * returns the Express response body and may carry `usage` for neuron accounting.
+ */
+async function withPool({ pool, maxRetries, res, buildUrl, body, stream, model, log }) {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    const account = pool.getAvailable();
+    if (!account) {
+      return res.status(503).json({ error: "No available accounts", pool: pool.stats() });
+    }
+    const url = buildUrl(account.account_id);
+
+    let released = false;
+    const release = () => {
+      if (!released) { released = true; pool.release(account.id); }
+    };
+    try {
+      if (stream) {
+        let prepared = false;
+        const result = await callStream(url, account.api_key, body, (chunk) => {
+          if (!prepared) {
+            res.status(200);
+            res.setHeader("Content-Type", "text/event-stream");
+            res.setHeader("Cache-Control", "no-cache");
+            res.setHeader("X-CF-Proxy-Account", account.name || String(account.id));
+            prepared = true;
+          }
+          // Honor backpressure: wait for drain before pulling the next chunk.
+          if (!res.write(chunk)) return new Promise((r) => res.once("drain", r));
+        });
+
+        if (result.status === 429) { pool.mark429(account.id); continue; }
+        if (result.status >= 400) {
+          log.warn?.(`Account ${account.name} stream -> ${result.status}: ${result.text?.slice(0, 200)}`);
+          return res.status(result.status).type("application/json").send(result.text);
+        }
+        pool.markSuccess(account.id, model, result.usage);
+        return res.end();
+      }
+
+      const result = await callNormal(url, account.api_key, body);
+      if (result.status === 429) { pool.mark429(account.id); continue; }
+      if (result.status >= 400) {
+        log.warn?.(`Account ${account.name} -> ${result.status}: ${result.text?.slice(0, 200)}`);
+        return res.status(result.status).type("application/json").send(result.text);
+      }
+      pool.markSuccess(account.id, model, result.usage);
+      return res.json(result.json);
+    } catch (e) {
+      // Mid-stream error: destroy so the client sees an aborted read, not a
+      // clean EOF that looks like a completed response.
+      log.warn?.(`Account ${account.name} error: ${e.message}`);
+      if (res.headersSent) return res.destroy(e);
+      continue;
+    } finally {
+      release();
+    }
+  }
+  if (res.headersSent) return res.end();
+  return res.status(502).json({ error: "All retries failed", pool: pool.stats() });
+}
+
+// OpenAI-compatible router: /v1/chat/completions and /v1/embeddings.
+export function openaiRouter({ pool, maxRetries, log }) {
   const router = Router();
 
   router.post("/chat/completions", async (req, res) => {
     const body = req.body;
-    if (!body || typeof body !== "object") {
-      return res.status(400).json({ error: "Invalid JSON" });
-    }
-    const model = body.model;
-    if (!model) return res.status(400).json({ error: "model required" });
-
+    if (!body || typeof body !== "object") return res.status(400).json({ error: "Invalid JSON" });
+    if (!body.model) return res.status(400).json({ error: "model required" });
     if (Array.isArray(body.messages)) body.messages = flattenContent(body.messages);
-    const stream = body.stream === true;
-
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
-      const account = pool.getAvailable();
-      if (!account) {
-        return res.status(503).json({ error: "No available accounts", pool: pool.stats() });
-      }
-      const url = chatUrl(account.account_id);
-
-      // getAvailable() reserved provisional budget on this account; release it
-      // exactly once when this attempt settles, whatever the outcome.
-      let released = false;
-      const release = () => {
-        if (!released) { released = true; pool.release(account.id); }
-      };
-      try {
-        if (stream) {
-          let prepared = false;
-          const result = await callStream(url, account.api_key, body, (chunk) => {
-            if (!prepared) {
-              res.status(200);
-              res.setHeader("Content-Type", "text/event-stream");
-              res.setHeader("Cache-Control", "no-cache");
-              res.setHeader("X-CF-Proxy-Account", account.name || String(account.id));
-              prepared = true;
-            }
-            // Honor backpressure: if the client is slow, wait for drain before
-            // pulling the next upstream chunk (else we buffer the whole stream).
-            if (!res.write(chunk)) {
-              return new Promise((resolve) => res.once("drain", resolve));
-            }
-          });
-
-          if (result.status === 429) {
-            pool.mark429(account.id);
-            continue; // nothing written yet on 4xx path
-          }
-          if (result.status >= 400) {
-            log.warn?.(`Account ${account.name} stream -> ${result.status}: ${result.text?.slice(0, 200)}`);
-            return res.status(result.status).type("application/json").send(result.text);
-          }
-          pool.markSuccess(account.id, model, result.usage);
-          return res.end();
-        }
-
-        const result = await callNormal(url, account.api_key, body);
-        if (result.status === 429) {
-          pool.mark429(account.id);
-          continue;
-        }
-        if (result.status >= 400) {
-          log.warn?.(`Account ${account.name} -> ${result.status}: ${result.text?.slice(0, 200)}`);
-          return res.status(result.status).type("application/json").send(result.text);
-        }
-        pool.markSuccess(account.id, model, result.usage);
-        return res.json(result.json);
-      } catch (e) {
-        // Timeout / network / abort. If we already streamed bytes we can't
-        // cleanly retry — DESTROY the socket (not res.end()) so the client sees
-        // an aborted read, not a clean EOF that looks like a complete response.
-        log.warn?.(`Account ${account.name} error: ${e.message}`);
-        if (res.headersSent) return res.destroy(e);
-        continue;
-      } finally {
-        release();
-      }
-    }
-
-    if (res.headersSent) return res.end();
-    return res.status(502).json({ error: "All retries failed", pool: pool.stats() });
+    return withPool({
+      pool, maxRetries, res, log,
+      buildUrl: (id) => chatUrl(id),
+      body, model: body.model, stream: body.stream === true,
+    });
   });
 
+  router.post("/embeddings", async (req, res) => {
+    const body = req.body;
+    if (!body || typeof body !== "object") return res.status(400).json({ error: "Invalid JSON" });
+    if (!body.model) return res.status(400).json({ error: "model required" });
+    return withPool({
+      pool, maxRetries, res, log,
+      buildUrl: (id) => embeddingsUrl(id),
+      body, model: body.model, stream: false,
+    });
+  });
+
+  return router;
+}
+
+// Generic CF router: /ai/run/:model — passthrough for any task/model.
+export function runRouter({ pool, maxRetries, log }) {
+  const router = Router();
+  // Model ids contain slashes (@cf/meta/m2m100-1.2b), so use a wildcard that
+  // matches the whole remaining path, then strip the leading slash.
+  router.post("/run/*", async (req, res) => {
+    const model = req.params[0];
+    if (!model) return res.status(400).json({ error: "model required in path" });
+    const body = req.body ?? {};
+    return withPool({
+      pool, maxRetries, res, log,
+      buildUrl: (id) => runUrl(id, model),
+      body, model, stream: false,
+    });
+  });
   return router;
 }

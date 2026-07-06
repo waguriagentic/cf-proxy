@@ -31,4 +31,5 @@ async function req(path, options = {}) {
 
 export const fetchAccounts = () => req("/api/accounts");
 export const fetchStats = () => req("/api/stats");
+export const fetchModels = (fresh = false) => req(fresh ? "/api/models?fresh=1" : "/api/models");
 export const runImport = () => req("/api/import", { method: "POST" });

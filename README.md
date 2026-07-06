@@ -61,11 +61,23 @@ Counters reset per account at **00:00 UTC** (lazily, on first use after the roll
 | Method | Path | Description |
 |--------|------|-------------|
 | GET  | `/health` | Pool stats (available / cooldown / neurons used+remaining today) |
-| GET  | `/v1/models` | List of CF Workers AI models |
-| POST | `/v1/chat/completions` | OpenAI-compatible chat completions (stream + non-stream) |
+| GET  | `/v1/models` | Live model list from CF (Cloudflare-hosted only, newest-first) |
+| POST | `/v1/chat/completions` | OpenAI-compatible chat (stream + non-stream) |
+| POST | `/v1/embeddings` | OpenAI-compatible embeddings |
+| POST | `/ai/run/:model` | Generic CF passthrough for ANY task (image, speech, translation, …) |
 | GET  | `/api/stats` | Aggregate pool + neuron stats (dashboard) |
-| GET  | `/api/accounts` | Per-account rows: status, neurons today, remaining, requests (dashboard) |
+| GET  | `/api/accounts` | Per-account rows: status, neurons today, remaining, requests |
+| GET  | `/api/models` | Rich model list (name, task, capabilities, added date) for the dashboard |
 | POST | `/api/import` | Manual import from the 9router DB → `{imported, skipped, total}` |
+
+The proxy supports **all Cloudflare Workers AI capabilities**, not just chat:
+text generation, embeddings, text-to-image, text-to-speech, speech recognition,
+translation, classification, and image-to-text. Each call rotates across the
+account pool with the same 429-cooldown and neuron-budget logic as chat.
+
+> Note on neuron accounting: chat and `/ai/run` responses include token usage,
+> so they're counted. CF's embeddings endpoint returns no `usage`, so embeddings
+> calls are not counted toward the per-account neuron budget (they're cheap).
 
 When `CF_PROXY_API_KEY` is set, `/v1/*`, `/api/*`, and `/health` require
 `Authorization: Bearer <key>`. The dashboard prompts for the key and stores it locally.

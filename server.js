@@ -9,7 +9,7 @@ import { dirname, join } from "node:path";
 
 import { initDb } from "./lib/db.js";
 import { AccountPool } from "./lib/pool.js";
-import { chatRouter } from "./routes/chat.js";
+import { openaiRouter, runRouter } from "./routes/chat.js";
 import { adminRouter } from "./routes/admin.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -56,7 +56,7 @@ app.use((err, _req, res, next) => {
 // Bearer auth on API/proxy paths only (skipped when API_KEY is empty). The
 // static dashboard (HTML/JS/assets) stays reachable so you can enter the key;
 // it then sends the key on its /api and /health calls.
-const PROTECTED = ["/v1", "/api", "/health"];
+const PROTECTED = ["/v1", "/api", "/health", "/ai"];
 app.use((req, res, next) => {
   if (!API_KEY) return next();
   // Express routes case-insensitively, so match the same way — else /V1/... slips past.
@@ -67,7 +67,8 @@ app.use((req, res, next) => {
   return res.status(401).json({ error: "Unauthorized" });
 });
 
-app.use("/v1", chatRouter({ pool, maxRetries: MAX_RETRIES, log }));
+app.use("/v1", openaiRouter({ pool, maxRetries: MAX_RETRIES, log })); // chat + embeddings
+app.use("/ai", runRouter({ pool, maxRetries: MAX_RETRIES, log })); // /ai/run/:model (generic)
 app.use("/", adminRouter({ db, pool, ninePath: NINE_DB, log }));
 
 // Serve the built dashboard (SPA) if present.

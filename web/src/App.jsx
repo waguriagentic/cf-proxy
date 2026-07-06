@@ -11,11 +11,13 @@ import {
   Text,
   Popover,
   PasswordInput,
+  Tabs,
 } from "@mantine/core";
 import { useInterval } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import StatsCards from "./components/StatsCards.jsx";
 import AccountsTable from "./components/AccountsTable.jsx";
+import ModelsTable from "./components/ModelsTable.jsx";
 import ImportButton from "./components/ImportButton.jsx";
 import { fetchAccounts, getKey, setKey } from "./api.js";
 
@@ -103,15 +105,25 @@ export default function App() {
         ) : (
           <Stack gap="lg">
             <StatsCards stats={stats} />
-            <div>
-              <Group justify="space-between" mb="xs">
-                <Title order={4}>Accounts</Title>
-                <Text size="xs" c="dimmed">
-                  auto-refreshes every 10s · neuron counts are estimates
-                </Text>
-              </Group>
-              <AccountsTable accounts={data?.accounts || []} />
-            </div>
+            <Tabs defaultValue="accounts">
+              <Tabs.List mb="md">
+                <Tabs.Tab value="accounts">Accounts</Tabs.Tab>
+                <Tabs.Tab value="models">Models</Tabs.Tab>
+              </Tabs.List>
+
+              <Tabs.Panel value="accounts">
+                <Group justify="flex-end" mb="xs">
+                  <Text size="xs" c="dimmed">
+                    auto-refreshes every 10s · neuron counts are estimates
+                  </Text>
+                </Group>
+                <AccountsTable accounts={data?.accounts || []} />
+              </Tabs.Panel>
+
+              <Tabs.Panel value="models">
+                <ModelsTable />
+              </Tabs.Panel>
+            </Tabs>
           </Stack>
         )}
       </AppShell.Main>

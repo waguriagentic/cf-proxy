@@ -3,22 +3,7 @@
 import { Router } from "express";
 import { importFrom9router } from "../lib/importer.js";
 import { NEURON_FREE_DAILY, todayUTC } from "../lib/neurons.js";
-
-export const MODELS = [
-  "@cf/meta/llama-3.2-1b-instruct",
-  "@cf/meta/llama-3.2-3b-instruct",
-  "@cf/meta/llama-3.1-8b-instruct-fp8-fast",
-  "@cf/meta/llama-3.1-8b-instruct-awq",
-  "@cf/meta/llama-3.1-70b-instruct-fp8-fast",
-  "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-  "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
-  "@cf/mistralai/mistral-small-3.1-24b-instruct",
-  "@cf/moonshotai/kimi-k2.5",
-  "@cf/moonshotai/kimi-k2.6",
-  "@cf/zai-org/glm-4.7-flash",
-  "@cf/qwen/qwq-32b",
-  "@cf/qwen/qwen2.5-coder-32b-instruct",
-];
+import { getModels, invalidateModels } from "../lib/models.js";
 
 // Shape one DB row for the dashboard: expose derived neuron figures, never the key.
 function shapeAccount(row) {
@@ -48,13 +33,34 @@ function shapeAccount(row) {
 export function adminRouter({ db, pool, ninePath, log }) {
   const router = Router();
 
+  const pick = () => pool.peekAccount();
+
   router.get("/health", (_req, res) => res.json({ status: "ok", pool: pool.stats() }));
 
-  router.get("/v1/models", (_req, res) => {
-    res.json({
-      object: "list",
-      data: MODELS.map((id) => ({ id, object: "model", owned_by: "cloudflare" })),
-    });
+  // OpenAI-compatible model list, fetched live from CF (cached 10 min).
+  router.get("/v1/models", async (_req, res) => {
+    try {
+      const models = await getModels(pick, log.warn);
+      res.json({
+        object: "list",
+        data: models.map((m) => ({ id: m.id, object: "model", owned_by: "cloudflare" })),
+      });
+    } catch (e) {
+      log.error?.(`/v1/models failed: ${e.message}`);
+      res.status(502).json({ error: "Failed to fetch model list" });
+    }
+  });
+
+  // Richer model list for the dashboard (name, description, tags).
+  router.get("/api/models", async (req, res) => {
+    try {
+      const fresh = req.query.fresh === "1";
+      const models = await getModels(pick, log.warn, { fresh });
+      res.json({ models });
+    } catch (e) {
+      log.error?.(`/api/models failed: ${e.message}`);
+      res.status(502).json({ error: "Failed to fetch model list" });
+    }
   });
 
   router.get("/api/stats", (_req, res) => res.json(pool.stats()));
@@ -68,6 +74,7 @@ export function adminRouter({ db, pool, ninePath, log }) {
   router.post("/api/import", (_req, res) => {
     try {
       const result = importFrom9router(db, ninePath, log);
+      invalidateModels(); // a freshly-imported account may enable the model fetch
       res.json(result);
     } catch (e) {
       log.error?.(`import failed: ${e.message}`);
